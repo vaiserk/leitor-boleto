@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<title>Receptor de Boletos</title>
+<style>
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:"Segoe UI",system-ui,sans-serif; background:#f1f5f9; color:#0f172a; }
+  header { background:#0f172a; color:#fff; padding:14px 22px; display:flex; align-items:center; gap:14px; }
+  header h1 { font-size:19px; margin:0; flex:1; }
+  header label { font-size:14px; display:flex; align-items:center; gap:6px; cursor:pointer; }
+  button { border:0; border-radius:8px; padding:9px 14px; font-size:14px; cursor:pointer; background:#e2e8f0; color:#0f172a; }
+  button.pri { background:#2563eb; color:#fff; }
+  button.ok { background:#16a34a; color:#fff; }
+  header button { background:#1e293b; color:#fff; }
+  #status { padding:12px 22px; font-size:15px; background:#dbeafe; color:#1e3a8a; }
+  #status.novo { background:#dcfce7; color:#14532d; font-weight:600; }
+  main { padding:16px 22px; }
+  table { width:100%; border-collapse:collapse; background:#fff; border-radius:10px; overflow:hidden; box-shadow:0 1px 3px rgba(0,0,0,.08); }
+  th, td { padding:10px 12px; text-align:left; font-size:14px; border-bottom:1px solid #e2e8f0; vertical-align:middle; }
+  th { background:#f8fafc; color:#475569; font-weight:600; }
+  td.linha { font-family:Consolas,monospace; font-size:13.5px; }
+  td.valor { font-weight:700; white-space:nowrap; }
+  tr.pago td { color:#94a3b8; }
+  tr.pago td.valor { text-decoration:line-through; }
+  td.acoes { white-space:nowrap; }
+  td.acoes button { padding:7px 10px; margin-right:4px; }
+  .vazio { text-align:center; color:#64748b; padding:40px; }
+  .modal { position:fixed; inset:0; background:rgba(15,23,42,.6); display:none; align-items:center; justify-content:center; }
+  .modal .caixa { background:#fff; border-radius:14px; padding:24px; width:min(440px,92vw); text-align:center; }
+  .modal p { color:#475569; font-size:14px; }
+  .modal input { width:100%; padding:8px; font-size:13px; border:1px solid #cbd5e1; border-radius:6px; }
+  #qr svg { width:260px; height:260px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Receptor de Boletos</h1>
+  <label><input type="checkbox" id="auto"> Copiar sozinho quando chegar</label>
+  <button id="btnParear">Parear celular</button>
+  <button id="btnSair">Encerrar programa</button>
+</header>
+<div id="status">Carregando...</div>
+<main>
+  <table>
+    <thead><tr><th>Recebido</th><th>Tipo</th><th>Valor</th><th>Vencimento</th><th>Linha digitável</th><th>Ações</th></tr></thead>
+    <tbody id="corpo"><tr><td colspan="6" class="vazio">Nenhum boleto ainda. Leia um com o celular.</td></tr></tbody>
+  </table>
+</main>
+
+<div class="modal" id="modal">
+  <div class="caixa">
+    <h2 style="margin-top:0">Parear celular</h2>
+    <div id="qr"></div>
+    <p>Leia este QR code com a câmera do celular. Ele abre o Leitor de Boletos já ligado a este PC.<br>
+       <b>Não mostre este QR pra ninguém</b>: ele tem a chave do seu pareamento.</p>
+    <p style="text-align:left;margin-bottom:4px">Endereço da página do celular:</p>
+    <input id="pagina">
+    <div style="margin-top:14px;display:flex;gap:8px;justify-content:center">
+      <button id="btnSalvarPagina">Salvar endereço</button>
+      <button class="pri" id="btnFechar">Fechar</button>
+    </div>
+  </div>
+</div>
+
+<script src="/qrcode.js"></script>
+<script>
+"use strict";
+const TOKEN = location.hash.slice(1);
+const $ = (id) => document.getElementById(id);
+let estado = null, ultimaNovidade = null, mostrouQRInicial = false;
+
+async function api(caminho, corpo) {
+  const r = await fetch(caminho, {
+    method: corpo ? "POST" : "GET",
+    headers: { "X-Token": TOKEN, "Content-Type": "application/json" },
+    body: corpo ? JSON.stringify(corpo) : undefined,
+  });
+  if (!r.ok) throw new Error("HTTP " + r.status);
+  return r.json();
+}
+
+const brl = (v) => v == null ? "ver boleto" : v.toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
+const dataBR = (iso) => iso ? iso.split("-").reverse().join("/") : "—";
+function formatarLinha(l) {
+  if (l.length === 47) return `${l.slice(0,5)}.${l.slice(5,10)} ${l.slice(10,15)}.${l.slice(15,21)} ${l.slice(21,26)}.${l.slice(26,32)} ${l[32]} ${l.slice(33)}`;
+  if (l.length === 48) return [0,1,2,3].map(i => l.slice(i*12, i*12+11) + "-" + l[i*12+11]).join(" ");
+  return l;
+}
+const esc = (s) => String(s).replace(/[&<>"]/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;" }[c]));
+
+function desenhar() {
+  const s = $("status");
+  s.textContent = estado.status;
+  if (ultimaNovidade !== null && estado.novidades !== ultimaNovidade) {
+    s.className = "novo";
+    setTimeout(() => s.className = "", 6000);
+  }
+  ultimaNovidade = estado.novidades;
+  $("auto").checked = estado.auto;
+
+  const itens = [...estado.itens].reverse(); // mais novo em cima
+  $("corpo").innerHTML = itens.length ? itens.map(it => `
+    <tr class="${it.pago ? "pago" : ""}">
+      <td>${esc(it.recebido)}</td>
+      <td>${esc(it.tipo)}</td>
+      <td class="valor">${brl(it.valor)}</td>
+      <td>${dataBR(it.venc)}</td>
+      <td class="linha">${esc(formatarLinha(it.linha))}</td>
+      <td class="acoes">
+        <button class="pri" data-acao="linha" data-id="${esc(it.id)}">Copiar linha</button>
+        <button data-acao="codigo" data-id="${esc(it.id)}">Copiar cód. barras</button>
+        <button class="${it.pago ? "" : "ok"}" data-acao="pago" data-id="${esc(it.id)}">${it.pago ? "Desmarcar" : "Marcar pago"}</button>
+        <button data-acao="remover" data-id="${esc(it.id)}">✕</button>
+      </td>
+    </tr>`).join("") : '<tr><td colspan="6" class="vazio">Nenhum boleto ainda. Leia um com o celular.</td></tr>';
+}
+
+async function atualizar() {
+  try {
+    estado = await api("/api/estado");
+    desenhar();
+    if (!mostrouQRInicial && estado.itens.length === 0) { mostrouQRInicial = true; abrirQR(); }
+    mostrouQRInicial = true;
+  } catch (e) {
+    $("status").textContent = "Programa fechado ou sem acesso. Abra o Receptor de Boletos de novo.";
+  }
+}
+
+function abrirQR() {
+  const qr = qrcode(0, "M");
+  qr.addData(estado.pareamento);
+  qr.make();
+  $("qr").innerHTML = qr.createSvgTag({ cellSize: 6, margin: 2, scalable: true });
+  $("pagina").value = estado.pagina;
+  $("modal").style.display = "flex";
+}
+
+$("corpo").addEventListener("click", async (e) => {
+  const b = e.target.closest("button");
+  if (!b) return;
+  const id = b.dataset.id, acao = b.dataset.acao;
+  if (acao === "linha" || acao === "codigo") await api("/api/copiar", { ID: id, Campo: acao });
+  if (acao === "pago") await api("/api/pago", { ID: id });
+  if (acao === "remover" && confirm("Remover este boleto da lista?")) await api("/api/remover", { ID: id });
+  atualizar();
+});
+$("auto").onchange = async (e) => { await api("/api/config", { Auto: e.target.checked }); atualizar(); };
+$("btnParear").onclick = abrirQR;
+$("btnFechar").onclick = () => $("modal").style.display = "none";
+$("btnSalvarPagina").onclick = async () => { await api("/api/config", { Pagina: $("pagina").value }); await atualizar(); abrirQR(); };
+$("btnSair").onclick = async () => {
+  if (!confirm("Encerrar o Receptor de Boletos? O celular não vai mais conseguir mandar boletos pra cá até você abrir de novo.")) return;
+  await api("/api/sair", {});
+  document.body.innerHTML = '<p style="padding:40px;font-size:18px">Programa encerrado. Pode fechar esta aba.</p>';
+};
+
+atualizar();
+setInterval(atualizar, 1500);
+</script>
+</body>
+</html>
