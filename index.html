@@ -12,13 +12,8 @@
   header { padding:14px 16px; font-weight:700; font-size:18px; display:flex; justify-content:space-between; align-items:center; }
   header small { font-weight:400; color:var(--mut); font-size:12px; }
   main { padding:0 16px 32px; max-width:560px; margin:0 auto; }
-  .camera { position:relative; background:#000; border-radius:14px; overflow:hidden; aspect-ratio:4/3; display:none; }
-  .camera video { width:100%; height:100%; object-fit:cover; }
-  .mira { position:absolute; left:6%; right:6%; top:38%; height:24%; border:3px solid var(--ok); border-radius:10px; box-shadow:0 0 0 999px rgba(0,0,0,.35); }
-  .dica { position:absolute; bottom:8px; left:0; right:0; text-align:center; font-size:13px; color:#fff; text-shadow:0 1px 3px #000; }
   button { width:100%; padding:16px; margin-top:12px; border:0; border-radius:12px; font-size:17px; font-weight:600; color:#fff; background:var(--pri); }
   button.sec { background:#334155; }
-  button:disabled { opacity:.5; }
   .card { background:var(--card); border-radius:14px; padding:14px; margin-top:14px; }
   .linha { font-family:ui-monospace,Consolas,monospace; font-size:15px; word-break:break-all; margin-top:6px; }
   .rot { color:var(--mut); font-size:12px; }
@@ -32,6 +27,21 @@
   li span:last-child { color:var(--mut); white-space:nowrap; }
   #semConfig { display:none; }
   input[type=file] { display:none; }
+
+  /* câmera em tela cheia, como nos apps de banco */
+  #camBox { position:fixed; inset:0; background:#000; z-index:10; display:none; }
+  #camBox video { width:100%; height:100%; object-fit:cover; }
+  .mira { position:absolute; left:5%; right:5%; top:34%; height:32%; border:3px solid var(--ok); border-radius:12px;
+          box-shadow:0 0 0 9999px rgba(0,0,0,.45); }
+  .mira::after { content:""; position:absolute; left:0; right:0; top:50%; height:2px; background:rgba(239,68,68,.85); }
+  @media (orientation: portrait) { .mira { left:36%; right:36%; top:6%; height:80%; } .mira::after { left:50%; top:0; bottom:0; width:2px; height:auto; } }
+  .dica { position:absolute; top:10px; left:0; right:0; text-align:center; font-size:15px; color:#fff; text-shadow:0 1px 3px #000; padding:0 12px; }
+  .controles { position:absolute; bottom:12px; left:12px; right:12px; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .controles button { width:auto; margin:0; padding:10px 14px; font-size:14px; background:rgba(30,41,59,.85); }
+  .controles button.cancelar { background:rgba(239,68,68,.85); }
+  .controles label { color:#fff; font-size:13px; display:flex; align-items:center; gap:6px; flex:1; min-width:140px; }
+  .controles input[type=range] { flex:1; }
+  #debug { position:absolute; top:34px; left:0; right:0; text-align:center; font-size:11px; color:#cbd5e1; text-shadow:0 1px 2px #000; }
 </style>
 <!-- Leitor de código de barras de reserva, usado quando o navegador não tem o leitor nativo -->
 <script src="https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/umd/index.min.js"></script>
@@ -45,14 +55,21 @@
   </div>
 
   <div id="app">
-    <div class="camera" id="camBox">
+    <div id="camBox">
       <video id="video" playsinline muted></video>
       <div class="mira"></div>
-      <div class="dica">Encaixe o código de barras na faixa verde, deitado</div>
+      <div class="dica" id="dicaCam">Encaixe o código de barras na faixa verde, ocupando quase toda a largura</div>
+      <div id="debug"></div>
+      <div class="controles">
+        <button class="cancelar" id="btnCancelar">Cancelar</button>
+        <button id="btnTrocar" style="display:none">Trocar câmera</button>
+        <button id="btnLuz" style="display:none">Lanterna</button>
+        <label id="zoomBox" style="display:none">Zoom <input type="range" id="zoom" min="1" max="4" step="0.1"></label>
+      </div>
     </div>
 
     <button id="btnLer">📷 Ler boleto</button>
-    <button id="btnFoto" class="sec">Tirar foto do código (se a leitura ao vivo falhar)</button>
+    <button id="btnFoto" class="sec">📸 Tirar foto do código</button>
     <input type="file" id="arquivo" accept="image/*" capture="environment">
 
     <div id="status" class="status"></div>
@@ -223,6 +240,7 @@ async function processarLeitura(info) {
 /* ================== Leitura do código de barras ================== */
 const video = $("video"), canvas = $("canvas");
 let stream = null, lendo = false, detectorNativo = null, leitorZxing = null;
+let cameras = [], quadros = 0, ultimaInvalida = "";
 
 async function prepararDetectores() {
   if ("BarcodeDetector" in window) {
@@ -240,84 +258,215 @@ async function prepararDetectores() {
   }
 }
 
-// Tenta ler um código de 44 dígitos válido numa imagem já desenhada no canvas.
-async function decodificarCanvas() {
-  const candidatos = [];
-  if (detectorNativo) {
-    try { (await detectorNativo.detect(canvas)).forEach(b => candidatos.push(b.rawValue)); } catch (e) {}
-  }
-  if (!candidatos.length && leitorZxing) {
-    try {
-      const fonte = new ZXing.HTMLCanvasElementLuminanceSource(canvas);
-      const r = leitorZxing.decode(new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(fonte)));
-      candidatos.push(r.getText());
-    } catch (e) {} // não achou nada neste quadro
-  }
-  let lidoInvalido = false;
-  for (const c of candidatos) {
-    const info = analisar(c);
+// Confere os textos lidos; devolve o boleto se algum for válido.
+function conferir(textos) {
+  for (const t of textos) {
+    const info = analisar(t);
     if (info) return info;
-    if (soDigitos(c).length >= 40) lidoInvalido = true;
+    const d = soDigitos(t);
+    if (d.length >= 10) ultimaInvalida = d.length + " dígitos";
   }
-  if (lidoInvalido) status("Leitura com erro (dígito não confere). Segure firme e aproxime.", "err");
   return null;
 }
 
-function desenhar(fonte, largura, altura, girar) {
-  const escala = Math.min(1, 1600 / Math.max(largura, altura));
-  const w = Math.round(largura * escala), h = Math.round(altura * escala);
+async function lerNativo(fonte) {
+  if (!detectorNativo) return [];
+  try { return (await detectorNativo.detect(fonte)).map(b => b.rawValue); } catch (e) { return []; }
+}
+
+function lerZxingCanvas() {
+  if (!leitorZxing) return [];
+  try {
+    const fonte = new ZXing.HTMLCanvasElementLuminanceSource(canvas);
+    return [leitorZxing.decode(new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(fonte))).getText()];
+  } catch (e) { return []; } // nada neste quadro
+}
+
+// Copia um pedaço da imagem pro canvas, girando 90° se pedido, sem perder resolução (até 'maximo' px).
+function recortar(fonte, sx, sy, sw, sh, girar, maximo) {
+  const esc = Math.min(1, maximo / Math.max(sw, sh));
+  const w = Math.round(sw * esc), h = Math.round(sh * esc);
   canvas.width = girar ? h : w; canvas.height = girar ? w : h;
   const ctx = canvas.getContext("2d", { willReadFrequently: true });
   ctx.save();
   if (girar) { ctx.translate(h, 0); ctx.rotate(Math.PI / 2); }
-  ctx.drawImage(fonte, 0, 0, w, h);
+  ctx.drawImage(fonte, sx, sy, sw, sh, 0, 0, w, h);
   ctx.restore();
 }
 
-async function iniciarCamera() {
-  if (!detectorNativo && !leitorZxing) { status("Este navegador não tem leitor de código. Use o Chrome atualizado.", "err"); return; }
+// Regiões onde procurar: o leitor reserva só acha o código perto do meio do recorte,
+// então a imagem é varrida em faixas deitadas e em pé (giradas).
+function regioes(l, a) {
+  const centrais = [
+    { sx: 0, sy: a * 0.3, sw: l, sh: a * 0.4, girar: false },
+    { sx: l * 0.3, sy: 0, sw: l * 0.4, sh: a, girar: true },
+  ];
+  const outras = [];
+  for (let c = 0.15; c < 0.9; c += 0.1) {
+    outras.push({ sx: 0, sy: a * (c - 0.09), sw: l, sh: a * 0.18, girar: false });
+    outras.push({ sx: l * (c - 0.09), sy: 0, sw: l * 0.18, sh: a, girar: true });
+  }
+  outras.push({ sx: 0, sy: 0, sw: l, sh: a, girar: false, max: 2400 });
+  outras.push({ sx: 0, sy: 0, sw: l, sh: a, girar: true, max: 2400 });
+  return { centrais, outras };
+}
+
+function tentarRegiao(fonte, l, a, r) {
+  const sx = Math.max(0, r.sx), sy = Math.max(0, r.sy);
+  const sw = Math.min(l - sx, r.sw), sh = Math.min(a - sy, r.sh);
+  recortar(fonte, sx, sy, sw, sh, r.girar, r.max || 3000);
+  return conferir(lerZxingCanvas());
+}
+
+// Quadro da câmera: uma região por quadro (metade das vezes a faixa central, onde fica a mira).
+// Foto: todas as regiões.
+async function tentarImagem(fonte, largura, altura, quadro) {
+  const { centrais, outras } = regioes(largura, altura);
+  if (quadro == null) {
+    for (const r of [...centrais, ...outras]) {
+      const info = tentarRegiao(fonte, largura, altura, r);
+      if (info) return info;
+      await new Promise(ok => setTimeout(ok, 0)); // deixa a tela respirar
+    }
+    return null;
+  }
+  const r = quadro % 2 === 0 ? centrais[(quadro / 2) % 2] : outras[((quadro - 1) / 2) % outras.length];
+  return tentarRegiao(fonte, largura, altura, r);
+}
+
+async function abrirStream(deviceId) {
+  const video = { width: { ideal: 2560 }, height: { ideal: 1440 } };
+  if (deviceId) video.deviceId = { exact: deviceId }; else video.facingMode = { ideal: "environment" };
+  return navigator.mediaDevices.getUserMedia({ video, audio: false });
+}
+
+// Em celulares com várias câmeras, prefere a principal ("camera2 0"), que foca de perto.
+async function listarCameras() {
+  const todas = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === "videoinput");
+  const traseiras = todas.filter(d => /back|traseira|rear|environment/i.test(d.label));
+  return traseiras.length ? traseiras : todas;
+}
+
+async function ajustarCamera() {
+  const track = stream.getVideoTracks()[0];
+  const caps = track.getCapabilities ? track.getCapabilities() : {};
+  const extras = [];
+  if (caps.focusMode && caps.focusMode.includes("continuous")) extras.push({ focusMode: "continuous" });
+  if (caps.zoom) {
+    const z = $("zoom");
+    z.min = caps.zoom.min; z.max = Math.min(caps.zoom.max, 5); z.step = caps.zoom.step || 0.1;
+    let salvo = NaN; try { salvo = parseFloat(localStorage.getItem("lb_zoom")); } catch (e) {}
+    z.value = Math.min(Number(z.max), isNaN(salvo) ? 2 : salvo);
+    extras.push({ zoom: Number(z.value) });
+    $("zoomBox").style.display = "flex";
+  } else $("zoomBox").style.display = "none";
+  $("btnLuz").style.display = caps.torch ? "inline-block" : "none";
+  for (const e of extras) { try { await track.applyConstraints({ advanced: [e] }); } catch (err) {} }
+}
+
+function atualizarDebug() {
+  const track = stream && stream.getVideoTracks()[0];
+  if (!track) return;
+  const st = track.getSettings ? track.getSettings() : {};
+  $("debug").textContent = `${video.videoWidth}×${video.videoHeight} · ${track.label || "câmera"} · foco ${st.focusMode || "?"}` +
+    ` · zoom ${st.zoom || 1} · leitor ${detectorNativo ? "nativo+zxing" : "zxing"} · ${quadros} quadros` +
+    (ultimaInvalida ? ` · última leitura ruim: ${ultimaInvalida}` : "");
+}
+
+async function telaCheia(ligar) {
   try {
-    stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false });
+    if (ligar) {
+      if (document.documentElement.requestFullscreen) await document.documentElement.requestFullscreen({ navigationUI: "hide" });
+      if (screen.orientation && screen.orientation.lock) await screen.orientation.lock("landscape");
+    } else {
+      if (screen.orientation && screen.orientation.unlock) screen.orientation.unlock();
+      if (document.fullscreenElement) await document.exitFullscreen();
+    }
+  } catch (e) {} // se o celular não deixar, segue em pé mesmo
+}
+
+async function iniciarCamera(deviceId) {
+  if (!detectorNativo && !leitorZxing) { status("Este navegador não tem leitor de código. Use o Chrome atualizado.", "err"); return; }
+  $("camBox").style.display = "block";
+  if (!deviceId) await telaCheia(true);
+  try {
+    if (!deviceId) { try { deviceId = localStorage.getItem("lb_cam") || undefined; } catch (e) {} }
+    try { stream = await abrirStream(deviceId); }
+    catch (e) { if (!deviceId) throw e; stream = await abrirStream(undefined); }
+    cameras = await listarCameras();
+    const atual = stream.getVideoTracks()[0].getSettings().deviceId;
+    const principal = cameras.find(c => /camera2 0\b|camera 0\b|\b0, facing back/i.test(c.label));
+    let salvo = null; try { salvo = localStorage.getItem("lb_cam"); } catch (e) {}
+    if (!salvo && principal && principal.deviceId !== atual) {
+      stream.getTracks().forEach(t => t.stop());
+      stream = await abrirStream(principal.deviceId);
+    }
   } catch (e) {
-    status("Sem acesso à câmera. Libere a permissão ou use \"Tirar foto\".", "err");
+    await pararCamera(false);
+    status("Sem acesso à câmera. Libere a permissão do Chrome ou use \"Tirar foto\".", "err");
     return;
   }
+  $("btnTrocar").style.display = cameras.length > 1 ? "inline-block" : "none";
   video.srcObject = stream;
   await video.play();
-  $("camBox").style.display = "block";
-  $("btnLer").textContent = "Parar câmera";
+  await ajustarCamera();
   status("Procurando código de barras...", "info");
-  lendo = true;
-  let tentativa = 0;
-  while (lendo) {
-    if (video.readyState >= 2) {
-      // alterna entre o quadro normal e girado, pra funcionar com o celular em pé ou deitado
-      desenhar(video, video.videoWidth, video.videoHeight, (tentativa++ % 2) === 1);
-      const info = await decodificarCanvas();
-      if (info) { pararCamera(); await processarLeitura(info); break; }
+  lendo = true; quadros = 0; ultimaInvalida = "";
+  const meuStream = stream;
+  while (lendo && stream === meuStream) {
+    if (video.readyState >= 2 && video.videoWidth) {
+      quadros++;
+      let info = conferir(await lerNativo(video));
+      if (!info) info = await tentarImagem(video, video.videoWidth, video.videoHeight, quadros);
+      if (quadros % 5 === 0) atualizarDebug();
+      if (info) { await pararCamera(true); await processarLeitura(info); return; }
     }
-    await new Promise(r => setTimeout(r, 150));
+    await new Promise(r => setTimeout(r, 60));
   }
 }
 
-function pararCamera() {
+async function pararCamera(sairTelaCheia) {
   lendo = false;
   if (stream) stream.getTracks().forEach(t => t.stop());
   stream = null;
   $("camBox").style.display = "none";
   $("btnLer").textContent = "📷 Ler próximo boleto";
+  if (sairTelaCheia) await telaCheia(false);
+}
+
+async function trocarCamera() {
+  if (cameras.length < 2 || !stream) return;
+  const atual = stream.getVideoTracks()[0].getSettings().deviceId;
+  const i = cameras.findIndex(c => c.deviceId === atual);
+  const prox = cameras[(i + 1) % cameras.length];
+  try { localStorage.setItem("lb_cam", prox.deviceId); } catch (e) {}
+  lendo = false;
+  stream.getTracks().forEach(t => t.stop());
+  stream = null;
+  await iniciarCamera(prox.deviceId);
+}
+
+let luz = false;
+async function alternarLuz() {
+  if (!stream) return;
+  luz = !luz;
+  try { await stream.getVideoTracks()[0].applyConstraints({ advanced: [{ torch: luz }] }); } catch (e) {}
+}
+
+async function mudarZoom() {
+  if (!stream) return;
+  const z = Number($("zoom").value);
+  try { localStorage.setItem("lb_zoom", String(z)); } catch (e) {}
+  try { await stream.getVideoTracks()[0].applyConstraints({ advanced: [{ zoom: z }] }); } catch (e) {}
 }
 
 async function lerFoto(arquivo) {
   status("Lendo a foto...", "info");
   const img = await createImageBitmap(arquivo);
-  for (const girar of [false, true]) {
-    desenhar(img, img.width, img.height, girar);
-    const info = await decodificarCanvas();
-    if (info) { await processarLeitura(info); return; }
-  }
-  status("Não achei um código de barras válido na foto. Tire mais de perto, com o código deitado e nítido.", "err");
+  let info = conferir(await lerNativo(img));
+  if (!info) info = await tentarImagem(img, img.width, img.height, null);
+  if (info) { await processarLeitura(info); return; }
+  status("Não achei um código de barras válido na foto. Tire mais de perto, com o código nítido e ocupando a foto de ponta a ponta.", "err");
 }
 
 /* ================== Início ================== */
@@ -330,7 +479,11 @@ async function lerFoto(arquivo) {
   $("pareado").textContent = "pareado ✓";
   await prepararDetectores();
 
-  $("btnLer").onclick = () => lendo ? pararCamera() : iniciarCamera();
+  $("btnLer").onclick = () => iniciarCamera();
+  $("btnCancelar").onclick = () => { pararCamera(true); status("Leitura cancelada.", "info"); };
+  $("btnTrocar").onclick = trocarCamera;
+  $("btnLuz").onclick = alternarLuz;
+  $("zoom").oninput = mudarZoom;
   $("btnFoto").onclick = () => $("arquivo").click();
   $("arquivo").onchange = (e) => { const f = e.target.files[0]; if (f) lerFoto(f); e.target.value = ""; };
   $("btnReenviar").onclick = async () => {
